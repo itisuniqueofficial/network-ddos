@@ -1,6 +1,6 @@
-aiohttp==3.9.3
+aiohttp==3.11.0b0
 aiohttp_socks==0.8.4
 faker==23.2.0
-tqdm==4.66.2
+tqdm==4.66.3
 matplotlib==3.8.3
 colorama==0.4.6
