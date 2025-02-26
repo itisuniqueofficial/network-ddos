@@ -20,7 +20,7 @@
 ### Steps
 1. **Clone the Repository**:
    ```bash
-   git clone https://github.com/yourusername/network-ddos.git
+   git clone https://github.com/itisuniqueofficial/network-ddos.git
    cd network-ddos
    ```
 2. **Install Dependencies**:
